@@ -10,45 +10,22 @@ import redis.clients.jedis.util.Pool;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
-import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
 
 /** Shared cleaned/scanned/pending-login keys plus BCH location for cross-server online. */
 public final class RedisState {
-
-    /** F13: connection settings; defaults preserve the previous hardcoded values. */
-    public static final class Options {
-        public String sentinelMaster = "azpbmd";
-        public java.util.List<String> sentinels = java.util.List.of(
-                "10.0.0.1:26379", "10.0.0.2:26379", "10.0.0.3:26379");
-        public String fallbackHost = "10.0.0.3";
-        public int fallbackPort = 6379;
-        public String passwordFile = "/mnt/pool/skygate/redis.pass";
-        /**
-         * F5: when true, an unreachable Redis means "treat as online" (skip the
-         * player) instead of "safe to clean". Matches the Paper side.
-         */
-        public boolean failClosed = true;
-    }
-
     private final Logger logger;
-    private final Options opts;
     private Pool<Jedis> pool;
 
     public RedisState(Logger logger) {
-        this(logger, new Options());
-    }
-
-    public RedisState(Logger logger, Options opts) {
         this.logger = logger;
-        this.opts = opts != null ? opts : new Options();
     }
 
     public void start() {
         String password = "";
         try {
-            Path pf = Path.of(opts.passwordFile);
+            Path pf = Path.of("redis.pass");
             if (Files.isRegularFile(pf)) {
                 password = Files.readString(pf).trim();
             }
@@ -56,49 +33,30 @@ public final class RedisState {
         }
         JedisPoolConfig cfg = new JedisPoolConfig();
         cfg.setMaxTotal(4);
-        Set<String> sentinels = new HashSet<>(opts.sentinels);
-        Pool<Jedis> sentinelPool = null;
+        Set<String> sentinels = Set.of("127.0.0.1:26379", "127.0.0.1:26379", "127.0.0.1:26379");
         try {
-            sentinelPool = password.isBlank()
-                    ? new JedisSentinelPool(opts.sentinelMaster, sentinels, cfg, 3000)
-                    : new JedisSentinelPool(opts.sentinelMaster, sentinels, cfg, 3000, password);
-            try (Jedis j = sentinelPool.getResource()) {
+            pool = password.isBlank()
+                    ? new JedisSentinelPool("azpbmd", sentinels, cfg, 3000)
+                    : new JedisSentinelPool("azpbmd", sentinels, cfg, 3000, password);
+            try (Jedis j = pool.getResource()) {
                 j.ping();
             }
-            pool = sentinelPool;
-            logger.info("LoreCleaner Redis via Sentinel master={}", opts.sentinelMaster);
+            logger.info("LoreCleaner Redis via Sentinel master=azpbmd");
         } catch (Exception e) {
-            if (sentinelPool != null) {
+            logger.warn("LoreCleaner Sentinel failed ({}), falling back to 127.0.0.1:6379", e.getMessage());
+            if (pool != null) {
                 try {
-                    sentinelPool.close();
+                    pool.close();
                 } catch (Exception ignored) {
                 }
             }
-            logger.warn("LoreCleaner Sentinel failed ({}), falling back to {}:{}",
-                    e.getMessage(), opts.fallbackHost, opts.fallbackPort);
-            // F5: never let a Redis outage kill startup or report healthy while
-            // broken — degrade to pool == null instead.
-            Pool<Jedis> direct = null;
-            try {
-                direct = password.isBlank()
-                        ? new JedisPool(cfg, opts.fallbackHost, opts.fallbackPort, 3000)
-                        : new JedisPool(cfg, opts.fallbackHost, opts.fallbackPort, 3000, password);
-                try (Jedis j = direct.getResource()) {
-                    j.ping();
-                }
-                pool = direct;
-                logger.info("LoreCleaner Redis connected to {}:{}", opts.fallbackHost, opts.fallbackPort);
-            } catch (Exception e2) {
-                if (direct != null) {
-                    try {
-                        direct.close();
-                    } catch (Exception ignored) {
-                    }
-                }
-                pool = null;
-                logger.error("LoreCleaner Redis unavailable ({}) — running degraded; players will be skipped, not cleaned",
-                        e2.getMessage());
+            pool = password.isBlank()
+                    ? new JedisPool(cfg, "127.0.0.1", 6379, 3000)
+                    : new JedisPool(cfg, "127.0.0.1", 6379, 3000, password);
+            try (Jedis j = pool.getResource()) {
+                j.ping();
             }
+            logger.info("LoreCleaner Redis connected to 127.0.0.1:6379");
         }
     }
 
@@ -116,24 +74,9 @@ public final class RedisState {
         return pool != null;
     }
 
-    /**
-     * True if BackChatHelper says they are on some network server.
-     * F5: fail closed — when the online status cannot be determined, treat the
-     * player as online so they are skipped instead of wrongly cleaned.
-     */
     public boolean isNetworkOnline(UUID uuid) {
-        if (uuid == null) {
-            return opts.failClosed;
-        }
-        if (pool == null) {
-            return opts.failClosed;
-        }
-        try (Jedis j = pool.getResource()) {
-            String loc = j.get("bch:loc:" + uuid);
-            return loc != null && !loc.isBlank();
-        } catch (Exception e) {
-            return opts.failClosed;
-        }
+        String loc = get("bch:loc:" + uuid);
+        return loc != null && !loc.isBlank();
     }
 
     public Long getScanned(UUID uuid) {

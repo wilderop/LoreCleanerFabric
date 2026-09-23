@@ -11,6 +11,7 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.Vec3;
 
 import java.io.File;
@@ -67,22 +68,18 @@ final class PlayerDat {
             if (r.extracted.isEmpty()) {
                 continue;
             }
-            // F2: fully transactional per slot. Serialize the remainder FIRST;
-            // only after encoding succeeds do we commit the slot mutation AND
-            // queue the extracted lore. On encoding failure the original slot
-            // bytes stay untouched and nothing is queued, so a dupe is
-            // impossible (encode() already flagged conversionFailures).
-            if (r.remaining != null && !r.remaining.isEmpty()) {
-                CompoundTag saved = encode(r.remaining, access);
-                if (saved == null) {
-                    continue;
-                }
-                list.set(i, saved);
-                dirty = true;
-            } else {
-                remove.add(i);
-            }
             out.addAll(r.extracted);
+            if (r.remaining == null || r.remaining.isEmpty()) {
+                remove.add(i);
+            } else {
+                CompoundTag saved = encode(r.remaining, access);
+                if (saved != null) {
+                    list.set(i, saved);
+                    dirty = true;
+                } else {
+                    remove.add(i);
+                }
+            }
         }
         for (int i = remove.size() - 1; i >= 0; i--) {
             list.remove(remove.get(i));
@@ -99,125 +96,33 @@ final class PlayerDat {
         return new Vec3(list.getDouble(0).orElse(0.0), list.getDouble(1).orElse(0.0), list.getDouble(2).orElse(0.0));
     }
 
-    /**
-     * F10: fail closed — return null when the logout dimension cannot be
-     * resolved instead of dropping nether/end coordinates into the overworld.
-     */
     ServerLevel level(MinecraftServer server) {
-        String dim = dimensionId();
-        if (dim == null || dim.isBlank()) {
-            return null;
-        }
-        Identifier id = Identifier.tryParse(dim);
-        if (id == null) {
-            return null;
-        }
-        for (ServerLevel level : server.getAllLevels()) {
-            if (level.dimension().identifier().equals(id)) {
-                return level;
+        String dim = string("Dimension");
+        if (dim != null && !dim.isBlank()) {
+            Identifier id = Identifier.tryParse(dim);
+            if (id != null) {
+                for (ServerLevel level : server.getAllLevels()) {
+                    if (level.dimension().identifier().equals(id)) {
+                        return level;
+                    }
+                }
             }
         }
-        return null;
-    }
-
-    String dimensionId() {
-        return string("Dimension");
+        return server.getLevel(Level.OVERWORLD);
     }
 
     void save() throws Exception {
         if (!dirty) {
             return;
         }
-        // F15: timestamped backup generations (keep the last 5) instead of a
-        // single file that gets overwritten on every save.
-        String ts = java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss")
-                .format(java.time.LocalDateTime.now());
-        Files.copy(file.toPath(),
-                new File(file.getAbsolutePath() + ".lorecleaner.bak." + ts).toPath(),
-                StandardCopyOption.REPLACE_EXISTING);
-        pruneBackups();
+        File bak = new File(file.getAbsolutePath() + ".lorecleaner.bak");
+        Files.copy(file.toPath(), bak.toPath(), StandardCopyOption.REPLACE_EXISTING);
         File tmp = new File(file.getAbsolutePath() + ".tmp");
         try (java.io.FileOutputStream fos = new java.io.FileOutputStream(tmp)) {
             NbtIo.writeCompressed(root, fos);
         }
         Files.move(tmp.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
         dirty = false;
-    }
-
-    private void pruneBackups() {
-        try {
-            File dir = file.getParentFile();
-            String prefix = file.getName() + ".lorecleaner.bak.";
-            File[] baks = dir.listFiles((d, n) -> n.startsWith(prefix));
-            if (baks == null || baks.length <= 5) {
-                return;
-            }
-            java.util.Arrays.sort(baks, (a, b) -> a.getName().compareTo(b.getName()));
-            for (int i = 0; i < baks.length - 5; i++) {
-                try {
-                    Files.deleteIfExists(baks[i].toPath());
-                } catch (Exception ignored) {
-                }
-            }
-        } catch (Exception ignored) {
-        }
-    }
-
-    /**
-     * F3: canonical per-section slot signatures of the PRE-CLEAN state, for the
-     * PDS strip authority check. Each signature is base64 of the canonical
-     * (CODEC-encoded, uncompressed NBT, no DataVersion) item bytes, so the DB
-     * side can reproduce them exactly via dual-decode.
-     */
-    java.util.Map<String, java.util.List<String>> canonicalSlotSignatures(RegistryAccess access) {
-        java.util.Map<String, java.util.List<String>> out = new java.util.LinkedHashMap<>();
-        out.put("inv", signaturesFor(list("Inventory"), access));
-        out.put("ec", signaturesFor(list("EnderItems"), access));
-        return out;
-    }
-
-    private java.util.List<String> signaturesFor(ListTag list, RegistryAccess access) {
-        java.util.List<String> sigs = new ArrayList<>();
-        if (list == null) {
-            return sigs;
-        }
-        for (int i = 0; i < list.size(); i++) {
-            try {
-                CompoundTag itemTag = compoundAt(list, i);
-                if (itemTag == null) {
-                    continue;
-                }
-                ItemStack stack = decode(itemTag, access);
-                if (stack == null || stack.isEmpty()) {
-                    continue;
-                }
-                byte[] canon = canonicalBytes(stack, access);
-                if (canon != null) {
-                    sigs.add(java.util.Base64.getEncoder().encodeToString(canon));
-                }
-            } catch (Exception ignored) {
-            }
-        }
-        return sigs;
-    }
-
-    /**
-     * Canonical byte form of an item: CODEC-encoded, uncompressed NBT, with any
-     * DataVersion tag stripped so .dat-side and DB-side signatures agree.
-     */
-    static byte[] canonicalBytes(ItemStack stack, RegistryAccess access) {
-        try {
-            Tag tag = ItemStack.CODEC.encodeStart(access.createSerializationContext(NbtOps.INSTANCE), stack).getOrThrow();
-            if (!(tag instanceof CompoundTag compound)) {
-                return null;
-            }
-            compound.remove("DataVersion");
-            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
-            NbtIo.write(compound, new java.io.DataOutputStream(out));
-            return out.toByteArray();
-        } catch (Exception e) {
-            return null;
-        }
     }
 
     private ListTag list(String key) {

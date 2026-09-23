@@ -30,6 +30,7 @@ dependencies {
     implementation("redis.clients:jedis:4.4.6")
     include("redis.clients:jedis:4.4.6")
     include("org.apache.commons:commons-pool2:2.11.1")
+    include("org.json:json:20231013")
     implementation("com.google.code.gson:gson:2.11.0")
     include("com.google.code.gson:gson:2.11.0")
     implementation("org.mariadb.jdbc:mariadb-java-client:3.5.1")
